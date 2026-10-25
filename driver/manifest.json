@@ -1,0 +1,25 @@
+{
+  "project": "VirtualDrivers/Virtual-Display-Driver",
+  "version": "25.7.23",
+  "source": "https://github.com/VirtualDrivers/Virtual-Display-Driver",
+  "release": "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/tag/25.7.23",
+  "download": "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip",
+  "archiveSha256": "E24210692B442B39AF763536330CE78B423F19342B7A7792C26DE3944E418B3A",
+  "architecture": "amd64 (release asset contains x86 in name, but INF [Standard.NTamd64] and DLL PE machine 0x8664)",
+  "license": "MIT; Copyright (c) 2024 Virtual Display",
+  "signature": "Authenticode Valid, SignPath Foundation; Windows trust validation is required again immediately before installation",
+  "files": [
+    {
+      "name": "MttVDD.inf",
+      "sha256": "550D211FE481E74DFE3F9D724ED78BE48B3A9113405965D683D9373E8D672F5D"
+    },
+    {
+      "name": "MttVDD.dll",
+      "sha256": "C9CA837F57A98FBD43BC416A7F535A95843626E7759EAF85CF0CD7CE334DBB05"
+    },
+    {
+      "name": "mttvdd.cat",
+      "sha256": "08A0093FC9B2E32B287A6F8A77CA4DE0A31830D29FC33D2B13A918DC859468F6"
+    }
+  ]
+}
