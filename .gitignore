@@ -1,0 +1,44 @@
+# .NET and IDE output
+**/[Bb]in/
+**/[Oo]bj/
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.pdb
+
+# Published packages and local build output
+/artifacts/
+/publish/
+/releases/
+*.zip
+*.7z
+
+# Local session state, display topology, logs and private test captures
+/work/
+/test-results/
+/power-test-results/
+/live-test-results/
+/diagnostics/
+/private-screenshots/
+**/session*.json
+**/display-backup*.json
+**/diagnostics*.json
+**/*-results.json
+**/*-success.json
+**/*snapshot*.json
+**/*.log
+**/*.dmp
+**/*.tmp
+
+# Machine-specific configuration and credentials
+.env
+.env.*
+*.local.json
+*.pfx
+*.p12
+*.key
+Thumbs.db
+Desktop.ini
