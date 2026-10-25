@@ -1,0 +1,82 @@
+name: Build Windows package
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Validate package metadata and bundled driver
+        id: metadata
+        env:
+          BUILD_REF_TYPE: ${{ github.ref_type }}
+          BUILD_REF_NAME: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [xml]$project = Get-Content -LiteralPath TopViewport.csproj -Raw
+          $packageVersion = [string]$project.Project.PropertyGroup.Version
+          if ($packageVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+            throw 'The project must declare a valid package version.'
+          }
+          if ($env:BUILD_REF_TYPE -eq 'tag' -and $env:BUILD_REF_NAME -ne "v$packageVersion") {
+            throw 'The release tag must match the version in TopViewport.csproj.'
+          }
+          $driverManifest = Get-Content -LiteralPath driver/manifest.json -Raw | ConvertFrom-Json
+          foreach ($driverFile in $driverManifest.files) {
+            $driverPath = Join-Path driver $driverFile.name
+            $actualHash = (Get-FileHash -LiteralPath $driverPath -Algorithm SHA256).Hash
+            if ($actualHash -ne $driverFile.sha256) {
+              throw "Bundled driver hash mismatch: $($driverFile.name)"
+            }
+          }
+          "version=$packageVersion" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+
+      - name: Publish x64 application
+        env:
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          dotnet publish TopViewport.csproj --configuration Release --runtime win-x64 --self-contained false --output "artifacts/TopViewport-$env:PACKAGE_VERSION-win-x64"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The integration commands can change the desktop, install a driver or
+      # require an interactive GPU session. CI deliberately does not run them.
+      - name: Package documentation and application
+        env:
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packageDirectory = "artifacts/TopViewport-$env:PACKAGE_VERSION-win-x64"
+          $packageDocuments = @('README.md', 'README.zh-CN.md', 'LICENSE', 'CHANGELOG.md', '恢复显示设置.cmd')
+          foreach ($document in $packageDocuments) {
+            Copy-Item -LiteralPath $document -Destination $packageDirectory
+          }
+          Compress-Archive -LiteralPath $packageDirectory -DestinationPath "$packageDirectory.zip"
+
+      - name: Upload Windows ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: TopViewport-${{ steps.metadata.outputs.version }}-win-x64
+          path: artifacts/TopViewport-*.zip
+          if-no-files-found: error
+          compression-level: 0
