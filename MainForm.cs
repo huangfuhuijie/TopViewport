@@ -26,7 +26,18 @@ public sealed class MainForm : Form
     private readonly Button refresh = new() { Text = "刷新显示器", AutoSize = true };
     private readonly Button remove = new() { Text = "移除本工具安装的虚拟屏", AutoSize = true };
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 1000 };
+    private readonly System.Windows.Forms.Timer screenshotTimer = new() { Interval = 100 };
+    private readonly System.Windows.Forms.Timer screenshotPointerTimer = new() { Interval = 16 };
+    private ScreenshotCursorOverlay? screenshotPointer;
     private readonly NotifyIcon tray;
+    private readonly ToolStripMenuItem automaticWindowRecovery = new("自动找回跑屏窗口") { Checked=true,CheckOnClick=true };
+    private readonly WindowPlacementGuard windowPlacementGuard = new(Environment.ProcessId);
+    private bool initialWindowRecoveryPending;
+    private bool screenClipPointerMode;
+    private Rectangle screenClipSourceBounds;
+    private Rectangle screenClipPhysicalBounds;
+    private Rectangle screenClipPreviousRestriction;
+    private int screenClipVisibleHeight;
     private ProjectionEngine? engine;
     private ProjectionForm? projection;
     private SessionState? session;
@@ -51,6 +62,7 @@ public sealed class MainForm : Form
     private bool exitRequested;
     private bool allowClose;
     private bool closing;
+    private bool sessionEnding;
     private long previousTickAwake;
     private DateTimeOffset previousTickUtc;
     private long lastResumeNotification;
@@ -61,7 +73,7 @@ public sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "TopViewport 0.1.3 · 屏幕可用区域";
+        Text = "TopViewport 0.1.5 · 屏幕可用区域";
         Icon = AppIcons.Get(AppIconState.Idle);
         Font = new Font("Microsoft YaHei UI", 10F);
         BackColor = Color.FromArgb(246, 248, 251);
@@ -73,7 +85,7 @@ public sealed class MainForm : Form
         layout.RowStyles.Add(new RowStyle(SizeType.Percent,100));
         var title = new Label { Text="把完整桌面放在屏幕正常区域", Font=new Font(Font.FontFamily,17,FontStyle.Bold), AutoSize=true, ForeColor=Color.FromArgb(24,43,65) };
         layout.Controls.Add(title,0,0);
-        layout.Controls.Add(new Label { Text="桌面、任务栏和运行在虚拟主屏上的游戏，会一起显示在实体屏幕的上方。\n首次使用需要安装随包提供的已签名虚拟显示驱动。", Dock=DockStyle.Fill },0,1);
+        layout.Controls.Add(new Label { Text="桌面、任务栏和应用会显示在实体屏幕上方的正常区域。\nWindows 会看到两个屏幕；跑到投射屏后方的普通窗口会自动移回。", Dock=DockStyle.Fill },0,1);
         layout.Controls.Add(Field("实体屏幕（投射到这里）",physical),0,2);
         layout.Controls.Add(Field("虚拟主屏（桌面运行在这里）",virtualScreen),0,3);
         var settings = new FlowLayoutPanel { Dock=DockStyle.Fill, WrapContents=false, Padding=new Padding(0,8,0,0) };
@@ -94,17 +106,31 @@ public sealed class MainForm : Form
         bottom.Controls.Add(new Label { Text="游戏建议先用窗口 / 无边框模式并选择虚拟主屏。独占全屏、HDR 和特定游戏兼容性需验证。", Dock=DockStyle.Fill,Font=new Font(Font.FontFamily,8.5f),ForeColor=Color.DimGray },0,1);
         bottom.Controls.Add(remove,0,2); layout.Controls.Add(bottom,0,11); Controls.Add(layout);
         var menu = new ContextMenuStrip(); menu.Items.Add("显示控制面板",null,(_,_)=>ShowControlPanel());
+        menu.Items.Add("找回不可见窗口",null,(_,_)=>
+        {
+            int count=RecoverHiddenWindows(immediate:true,includeMinimized:true);
+            stateLabel.Text=session is { Completed:false }
+                ? (count>0 ? $"已请求找回 {count} 个跑屏窗口。" : "当前未发现需要找回的普通窗口。")
+                : "请先启用上方显示区域；单屏布局下不需要找回投射屏窗口。";
+        });
+        menu.Items.Add(automaticWindowRecovery);
         menu.Items.Add("重新连接显示区域",null,async (_,_)=>await ReconnectProjectionAsync("手动重新连接"));
         menu.Items.Add("恢复原显示设置",null,async (_,_)=>await StopProjectionAsync()); menu.Items.Add("恢复并退出",null,(_,_)=>Close());
         tray = new NotifyIcon { Icon=AppIcons.Get(AppIconState.Idle),Text="TopViewport · 已就绪",Visible=true,ContextMenuStrip=menu };
         tray.MouseClick += (_,e)=> { if(e.Button==MouseButtons.Left) ShowControlPanel(); };
         tray.DoubleClick += (_,_)=>ShowControlPanel();
+        automaticWindowRecovery.CheckedChanged += (_,_)=> { windowPlacementGuard.Reset(); initialWindowRecoveryPending=true; };
         start.Click += async (_,_)=>await StartProjectionAsync(); stop.Click += async (_,_)=>await StopProjectionAsync(); confirm.Click += (_,_)=>Confirm();
         install.Click += async (_,_)=>await ConfigureDriver(); remove.Click += async (_,_)=>await RemoveDriver(); refresh.Click += (_,_)=>RefreshDisplays();
         physical.SelectedIndexChanged += (_,_)=> { if (physical.SelectedItem is DisplayChoice c) { selectedPhysical=c.Info; if (c.Info.RefreshRate>=24 && c.Info.RefreshRate<=240) hz.Value=c.Info.RefreshRate; } UpdateDimensions(); };
         virtualScreen.SelectedIndexChanged += (_,_)=> { if(virtualScreen.SelectedItem is DisplayChoice c) selectedVirtual=c.Info; };
         bottomPixels.ValueChanged += (_,_)=>UpdateDimensions(); hz.ValueChanged += (_,_)=>UpdateDimensions();
         timer.Tick += (_,_)=>TickSession(); timer.Start();
+        screenshotTimer.Tick += (_,_)=>TickScreenshotCompatibility(); screenshotTimer.Start();
+        screenshotPointerTimer.Tick += (_,_)=>
+        {
+            if(screenClipPointerMode && Native.GetCursorPos(out var position)) screenshotPointer?.MoveTo(position);
+        };
         Shown += (_,_)=>
         {
             hotkeyRegistered=Native.RegisterHotKey(Handle,5512,0x0002|0x0001|0x4000,0x7B);
@@ -127,7 +153,7 @@ public sealed class MainForm : Form
             allowClose=true;
             Close();
         };
-        FormClosed += (_,_)=> { Native.UnregisterHotKey(Handle,5512); tray.Visible=false; tray.Dispose(); timer.Dispose(); };
+        FormClosed += (_,_)=> { Native.UnregisterHotKey(Handle,5512); tray.Visible=false; tray.Dispose(); timer.Dispose(); screenshotTimer.Dispose(); screenshotPointerTimer.Dispose(); screenshotPointer?.Dispose(); };
         // Hide the existing HWND, rather than recreating it by changing ShowInTaskbar.
         // Hiding during a minimize can leave WinForms' normal placement at -32000;
         // keep our own valid normal bounds and reset the hidden window to Normal.
@@ -356,25 +382,29 @@ public sealed class MainForm : Form
     }
     private async Task StartProjectionAsync()
     {
-        if(starting || restoring || reconnecting || session is { Completed:false } || exitRequested) return;
+        if(starting || restoring || reconnecting || session is { Completed:false } || exitRequested || sessionEnding) return;
         if(!hotkeyRegistered) { ReportProblem("恢复快捷键尚未注册，请释放 Ctrl+Alt+F12 后重新打开工具。"); return; }
         if(physical.SelectedItem is not DisplayChoice p || virtualScreen.SelectedItem is not DisplayChoice v) return;
         starting=true; stopRequested=false; SetControls(false); SetStatus(AppIconState.Recovering,"正在启用");
         await lifecycle.WaitAsync();
         try
         {
+            if(sessionEnding || stopRequested) return;
             // GDI DISPLAY numbers can change after a driver restart or wake.
             var displays=await Task.Run(()=>DisplayManager.ListDisplays());
+            if(sessionEnding || stopRequested) return;
             activePhysical=DisplayManager.FindCurrentDisplay(p.Info,displays) ?? throw new InvalidOperationException("实体屏幕尚未重新连接，请刷新显示器后重试。");
             activeVirtual=DisplayManager.FindCurrentDisplay(v.Info,displays) ?? throw new InvalidOperationException("虚拟屏幕尚未重新连接，请刷新显示器后重试。");
             activeMode=(activePhysical.Width,Math.Max(480,activePhysical.Height-(int)bottomPixels.Value),(int)hz.Value);
             var m=activeMode;
             var modes=await Task.Run(()=>DisplayManager.ListModes(activeVirtual.DeviceName));
+            if(sessionEnding || stopRequested) return;
             if(!modes.Any(x=>x.Width==m.Width && x.Height==m.Height && Math.Abs(x.RefreshRate-m.Refresh)<=1))
                 throw new InvalidOperationException($"虚拟屏尚未提供 {m.Width}×{m.Height} @ {m.Refresh}Hz。请先点击“安装 / 配置虚拟屏”，再刷新。");
             Directory.CreateDirectory(Program.StateDirectory);
             string snapshotPath=Path.Combine(Program.StateDirectory,"display-backup-"+Guid.NewGuid().ToString("N")+".json");
             await Task.Run(()=>DisplayManager.SaveSnapshot(DisplayManager.CaptureSnapshot(),snapshotPath));
+            if(sessionEnding || stopRequested) return;
             using var current=Process.GetCurrentProcess();
             var candidate=new SessionState { ParentPid=Environment.ProcessId,ParentStartTicks=current.StartTime.ToUniversalTime().Ticks,SnapshotPath=snapshotPath,Heartbeat=DateTimeOffset.UtcNow,ConfirmationDeadline=DateTimeOffset.UtcNow.AddSeconds(45) };
             // Publish only after BeginSession succeeds: a failed begin must not adopt or restore another session.
@@ -384,7 +414,7 @@ public sealed class MainForm : Form
             stop.Enabled=true;
             var applySession=session;
             applied=await Task.Run(()=>Recovery.ApplyCurrentSession(applySession,()=>DisplayManager.ApplyVirtualPrimary(activeVirtual.DeviceName,activePhysical.DeviceName,m.Width,m.Height,m.Refresh)));
-            if(!stopRequested && !suspended) await StartRenderingAsync();
+            if(!stopRequested && !suspended && !sessionEnding) await StartRenderingAsync();
             if(stopRequested) return;
             if(suspended) { stateLabel.Text="电脑正在睡眠，唤醒后会自动重新连接。"; return; }
             Location=new Point(30,30);
@@ -407,6 +437,7 @@ public sealed class MainForm : Form
 
     private async Task StartRenderingAsync()
     {
+        if(sessionEnding || stopRequested) return;
         if(applied==null || activeVirtual==null) throw new InvalidOperationException("显示布局尚未准备好。");
         var output=new Rectangle(applied.PhysicalBounds.Left,applied.PhysicalBounds.Top,applied.PhysicalBounds.Width,applied.PhysicalBounds.Height);
         projection=new ProjectionForm(output); projection.Show();
@@ -420,10 +451,15 @@ public sealed class MainForm : Form
         if(!Native.ClipCursor(ref rect)) throw new InvalidOperationException("无法把鼠标限定到虚拟主屏，已中止启用。");
         Native.SetCursorPos(Math.Min(350,m.Width/2),Math.Min(250,m.Height/2));
         startAt=lastFrameAt=Recovery.AwakeNowTicks; lastFrameCount=0;
+        windowPlacementGuard.Reset();
+        initialWindowRecoveryPending=true;
     }
 
     private async Task StopRenderingAsync()
     {
+        screenClipPointerMode=false;
+        screenshotPointerTimer.Stop(); screenshotPointer?.Hide();
+        windowPlacementGuard.Reset();
         Native.ClipCursor(IntPtr.Zero);
         var capture=engine; engine=null;
         if(capture!=null)
@@ -454,7 +490,7 @@ public sealed class MainForm : Form
         var utcNow=DateTimeOffset.UtcNow;
         bool clockGap=previousTickAwake!=0 && Math.Abs((utcNow-previousTickUtc).Ticks-(now-previousTickAwake))>5*TimeSpan.TicksPerSecond;
         previousTickAwake=now; previousTickUtc=utcNow;
-        if(session==null || session.Completed || restoring) return;
+        if(session==null || session.Completed || restoring || sessionEnding) return;
         if(!reconnecting && (clockGap || (suspended && now-suspendStartedAwake>5*TimeSpan.TicksPerSecond)))
         { _=ReconnectProjectionAsync("检测到睡眠、取消睡眠或遗漏的恢复通知"); return; }
         var disk=Recovery.Read(Program.SessionPath);
@@ -481,14 +517,22 @@ public sealed class MainForm : Form
                     throw new InvalidOperationException("系统改变了显示布局，已恢复原布局。可直接重新启用。");
                 }
                 var sourceBounds=new Rectangle(source.X,source.Y,source.Width,source.Height);
-                if(!Native.GetClipCursor(out var currentClip)) throw new InvalidOperationException("无法检查鼠标区域。");
-                var current=new Rectangle(currentClip.Left,currentClip.Top,currentClip.Right-currentClip.Left,currentClip.Bottom-currentClip.Top);
-                if(!sourceBounds.Contains(current))
+                if(!screenClipPointerMode)
                 {
-                    var restricted=Rectangle.Intersect(current,sourceBounds);
-                    if(restricted.Width<=0 || restricted.Height<=0) restricted=sourceBounds;
-                    var rect=new Native.Rect(restricted);
-                    if(!Native.ClipCursor(ref rect)) throw new InvalidOperationException("鼠标区域锁定失败。");
+                    if(!Native.GetClipCursor(out var currentClip)) throw new InvalidOperationException("无法检查鼠标区域。");
+                    var current=new Rectangle(currentClip.Left,currentClip.Top,currentClip.Right-currentClip.Left,currentClip.Bottom-currentClip.Top);
+                    if(!sourceBounds.Contains(current))
+                    {
+                        var restricted=Rectangle.Intersect(current,sourceBounds);
+                        if(restricted.Width<=0 || restricted.Height<=0) restricted=sourceBounds;
+                        var rect=new Native.Rect(restricted);
+                        if(!Native.ClipCursor(ref rect)) throw new InvalidOperationException("鼠标区域锁定失败。");
+                    }
+                }
+                if(!screenClipPointerMode && automaticWindowRecovery.Checked && engine?.FramesPresented>0)
+                {
+                    RecoverHiddenWindows(screens,immediate:initialWindowRecoveryPending,includeMinimized:initialWindowRecoveryPending);
+                    initialWindowRecoveryPending=false;
                 }
             }
             catch(Exception ex) { Program.Log(ex.ToString()); _=FailAndStopAsync(ex.Message); return; }
@@ -501,7 +545,7 @@ public sealed class MainForm : Form
             { _=FailAndStopAsync("未收到虚拟主屏画面，已恢复。"+engine.Status); return; }
             if(!engine.IsRunning && now-startAt>3*TimeSpan.TicksPerSecond)
             { _=FailAndStopAsync("投射已停止，可直接重新启用。"+engine.Status); return; }
-            if(!Recovery.IsResumeGrace(session) && (now-engine.LastLoopAwakeTicks>12*TimeSpan.TicksPerSecond ||
+            if(!screenClipPointerMode && !Recovery.IsResumeGrace(session) && (now-engine.LastLoopAwakeTicks>12*TimeSpan.TicksPerSecond ||
                (count>0 && now-lastFrameAt>15*TimeSpan.TicksPerSecond && Native.HasRecentInput(2000))))
             { _=FailAndStopAsync("捕获画面长时间没有响应，已恢复原布局，可重新启用。"+engine.Status); return; }
             stateLabel.Text=session.Confirmed ? $"正在显示完整虚拟桌面　|　{engine.Status}\n恢复快捷键：Ctrl+Alt+F12" : $"请确认画面正常：{(int)Recovery.ConfirmationSecondsRemaining(session)} 秒后自动恢复\n{engine.Status}";
@@ -553,7 +597,7 @@ public sealed class MainForm : Form
 
     private async Task ReconnectProjectionAsync(string reason)
     {
-        if(reconnecting || restoring || stopRequested || exitRequested) return;
+        if(reconnecting || restoring || stopRequested || exitRequested || sessionEnding) return;
         if(session==null || session.Completed)
         {
             suspended=false; RefreshDisplays(); return;
@@ -685,6 +729,100 @@ public sealed class MainForm : Form
         start.Enabled=enabled && hotkeyRegistered && !exitRequested && physical.Items.Count>0 && virtualScreen.Items.Count>0;
     }
 
+    private int RecoverHiddenWindows(IReadOnlyList<DisplayInfo>? displays=null,bool immediate=false,bool includeMinimized=false)
+    {
+        // Integration tests move only their explicitly supplied test windows.
+        if(automatedTest || applied==null || session is not { Completed:false } ||
+           restoring || starting || reconnecting || suspended || engine==null || engine.FramesPresented<1) return 0;
+        try
+        {
+            displays ??= DisplayManager.ListDisplays(false);
+            var source=displays.FirstOrDefault(d=>d.DeviceName==applied.VirtualDeviceName);
+            if(source==null || !source.IsPrimary) return 0;
+            var target=source.WorkArea==null
+                ? new Rectangle(source.X,source.Y,source.Width,source.Height)
+                : Rectangle.FromLTRB(source.WorkArea.Left,source.WorkArea.Top,source.WorkArea.Right,source.WorkArea.Bottom);
+            var blocked=new Rectangle(applied.PhysicalBounds.Left,applied.PhysicalBounds.Top,applied.PhysicalBounds.Width,applied.PhysicalBounds.Height);
+            var accessible=displays.Where(d=>d.DeviceName!=applied.VirtualDeviceName && d.DeviceName!=applied.PhysicalDeviceName)
+                .Select(d=>new Rectangle(d.X,d.Y,d.Width,d.Height)).ToArray();
+            int moved=windowPlacementGuard.RecoverWindows(target,blocked,accessible,immediate,includeMinimized);
+            if(moved>0) Program.Log($"Moved {moved} inaccessible application window(s) into the visible virtual desktop.");
+            return moved;
+        }
+        catch(Exception ex) { Program.Log("Window placement recovery: "+ex.Message); return 0; }
+    }
+
+    private void TickScreenshotCompatibility()
+    {
+        if(automatedTest || applied==null || session is not { Completed:false } || starting ||
+           restoring || reconnecting || suspended || engine==null || engine.FramesPresented<1) return;
+        try
+        {
+            var output=new Rectangle(applied.PhysicalBounds.Left,applied.PhysicalBounds.Top,applied.PhysicalBounds.Width,applied.PhysicalBounds.Height);
+            if(ScreenClipCompatibility.TryGetActiveOverlay(output,out _))
+            {
+                if(!screenClipPointerMode)
+                {
+                    var source=DisplayManager.ListDisplays(false).FirstOrDefault(d=>d.DeviceName==applied.VirtualDeviceName);
+                    if(source==null || !source.IsPrimary) return;
+                    EnterScreenClipPointerMode(new Rectangle(source.X,source.Y,source.Width,source.Height),output,activeMode.Height);
+                    Program.Log("Windows screenshot overlay detected; pointer temporarily uses physical output coordinates.");
+                }
+            }
+            else if(screenClipPointerMode && (Native.GetAsyncKeyState(1)&0x8000)==0 && (Native.GetAsyncKeyState(2)&0x8000)==0)
+            {
+                ExitScreenClipPointerMode();
+                Program.Log("Windows screenshot overlay closed; pointer returned to virtual desktop coordinates.");
+            }
+        }
+        catch(Exception ex)
+        {
+            Program.Log("Screenshot pointer recovery: "+ex);
+            screenClipPointerMode=false;
+            screenshotPointerTimer.Stop(); screenshotPointer?.Hide();
+            Native.ClipCursor(IntPtr.Zero);
+            _=FailAndStopAsync("截图鼠标区域未能正确恢复，已尝试恢复原显示布局。");
+        }
+    }
+
+    private void EnterScreenClipPointerMode(Rectangle source,Rectangle output,int visibleHeight)
+    {
+        if(!Native.GetCursorPos(out var cursor) || !Native.GetClipCursor(out var original))
+            throw new InvalidOperationException("无法读取截图前的鼠标区域。");
+        screenClipSourceBounds=source;
+        screenClipPhysicalBounds=output;
+        screenClipVisibleHeight=Math.Clamp(visibleHeight,1,output.Height);
+        var originalBounds=Rectangle.FromLTRB(original.Left,original.Top,original.Right,original.Bottom);
+        screenClipPreviousRestriction=source.Contains(originalBounds) && originalBounds.Width>0 && originalBounds.Height>0
+            ? originalBounds : source;
+        screenClipPointerMode=true;
+        var mapped=source.Contains(cursor) ? ScreenClipCompatibility.MapSourceToPhysical(cursor,source,output,screenClipVisibleHeight)
+            : new Point(Math.Clamp(cursor.X,output.Left,output.Right-1),Math.Clamp(cursor.Y,output.Top,output.Top+screenClipVisibleHeight-1));
+        Native.ClipCursor(IntPtr.Zero);
+        if(!Native.SetCursorPos(mapped.X,mapped.Y)) throw new InvalidOperationException("无法切换截图鼠标坐标。");
+        var physicalRestriction=new Native.Rect(new Rectangle(output.Left,output.Top,output.Width,screenClipVisibleHeight));
+        if(!Native.ClipCursor(ref physicalRestriction)) throw new InvalidOperationException("无法设置截图选区鼠标范围。");
+        screenshotPointer ??= new ScreenshotCursorOverlay();
+        screenshotPointer.ShowAt(mapped);
+        screenshotPointerTimer.Start();
+    }
+
+    private void ExitScreenClipPointerMode()
+    {
+        if(!screenClipPointerMode) return;
+        screenshotPointerTimer.Stop(); screenshotPointer?.Hide();
+        if(!Native.GetCursorPos(out var cursor)) throw new InvalidOperationException("无法读取截图结束的鼠标位置。");
+        var source=screenClipSourceBounds;
+        var mapped=source.Contains(cursor) ? cursor
+            : ScreenClipCompatibility.MapPhysicalToSource(cursor,source,screenClipPhysicalBounds,screenClipVisibleHeight);
+        Native.ClipCursor(IntPtr.Zero);
+        if(!Native.SetCursorPos(mapped.X,mapped.Y)) throw new InvalidOperationException("无法恢复桌面鼠标坐标。");
+        var restriction=new Native.Rect(screenClipPreviousRestriction);
+        if(!Native.ClipCursor(ref restriction)) throw new InvalidOperationException("无法恢复桌面鼠标区域。");
+        screenClipPointerMode=false;
+        lastFrameAt=Recovery.AwakeNowTicks;
+    }
+
     public async void RunTimedTest(string folder,bool powerCycle=false)
     {
         automatedTest=true;
@@ -779,6 +917,59 @@ public sealed class MainForm : Form
         while(engine?.FramesPresented==0 && Recovery.AwakeNowTicks<deadline) await Task.Delay(100);
         if(engine==null || !engine.IsRunning || engine.FramesPresented<1) throw new InvalidOperationException("投射未产生画面。");
     }
+    public async void RunWindowTest(string folder)
+    {
+        automatedTest=true;
+        Directory.CreateDirectory(folder);
+        string success=Path.Combine(folder,"window-test-success.json");
+        string failure=Path.Combine(folder,"window-test-failure.txt");
+        if(File.Exists(success)) File.Delete(success);
+        if(File.Exists(failure)) File.Delete(failure);
+        try
+        {
+            await StartProjectionAsync(); await WaitForFramesAsync(); Confirm();
+            if(session is not { Confirmed:true,Completed:false } || applied==null)
+                throw new InvalidOperationException("窗口找回测试未成功启用虚拟主屏。");
+            var displays=DisplayManager.ListDisplays(false);
+            var source=displays.Single(d=>d.DeviceName==applied.VirtualDeviceName);
+            var sourceBounds=new Rectangle(source.X,source.Y,source.Width,source.Height);
+            var work=source.WorkArea;
+            var targetArea=work==null ? sourceBounds : Rectangle.FromLTRB(work.Left,work.Top,work.Right,work.Bottom);
+            var blocked=new Rectangle(applied.PhysicalBounds.Left,applied.PhysicalBounds.Top,applied.PhysicalBounds.Width,applied.PhysicalBounds.Height);
+            var others=displays.Where(d=>d.DeviceName!=applied.VirtualDeviceName && d.DeviceName!=applied.PhysicalDeviceName)
+                .Select(d=>new Rectangle(d.X,d.Y,d.Width,d.Height)).ToArray();
+            WindowPlacementGuardTests.VerifyOwnedWindows(targetArea,blocked,others);
+            Native.SetCursorPos(sourceBounds.Left+sourceBounds.Width/3,sourceBounds.Top+sourceBounds.Height/3);
+            if(!Native.GetCursorPos(out var pointerBefore)) throw new InvalidOperationException("无法读取截图兼容测试坐标。");
+            EnterScreenClipPointerMode(sourceBounds,blocked,activeMode.Height);
+            if(!screenClipPointerMode || !Native.GetCursorPos(out var during) || !blocked.Contains(during))
+                throw new InvalidOperationException("截图兼容模式未切换到实体输出坐标。");
+            // The real session timer must leave the temporary screenshot restriction intact.
+            TickSession();
+            if(!Native.GetClipCursor(out var duringRestriction) || duringRestriction.Top!=blocked.Top)
+                throw new InvalidOperationException("桌面心跳覆盖了截图期间的鼠标区域。");
+            ExitScreenClipPointerMode();
+            if(screenClipPointerMode || !Native.GetCursorPos(out var after) ||
+                Math.Abs(after.X-pointerBefore.X)>2 || Math.Abs(after.Y-pointerBefore.Y)>2)
+                throw new InvalidOperationException("截图结束后未恢复原鼠标位置。");
+            if(!Native.GetClipCursor(out var restoredRestriction) || restoredRestriction.Top!=sourceBounds.Top || restoredRestriction.Bottom>sourceBounds.Bottom)
+                throw new InvalidOperationException("截图结束后鼠标区域未恢复虚拟主屏。");
+            await StopProjectionAsync();
+            File.WriteAllText(success,JsonSerializer.Serialize(new
+            {
+                Success=true,OnlyOwnedTestWindows=true,NormalWindowRecovered=true,MaximizedStatePreserved=true,
+                MinimizedWindowsNotOpened=true,NoForegroundActivation=true,AdditionalMonitorWindowTested=others.Length>0,
+                ScreenshotPointerRoundTrip=true,ScreenshotRestrictionPreservedDuringHeartbeat=true,
+                RealSystemScreenshotTested=false,LayoutRestored=session==null
+            },Program.JsonOptions));
+        }
+        catch(Exception ex)
+        {
+            Program.Log(ex.ToString()); await StopProjectionAsync(); File.WriteAllText(failure,ex.ToString());
+        }
+        finally { Close(); }
+    }
+
     public async void RunTrayTest(string folder)
     {
         automatedTest=true;
@@ -838,8 +1029,73 @@ public sealed class MainForm : Form
         var message=Message.Create(Handle,0x0218,new IntPtr(type),IntPtr.Zero);
         WndProc(ref message);
     }
+
+    public async void RunShutdownTest(string folder)
+    {
+        automatedTest=true;
+        Directory.CreateDirectory(folder);
+        string success=Path.Combine(folder,"shutdown-test-success.json");
+        string failure=Path.Combine(folder,"shutdown-test-failure.txt");
+        if(File.Exists(success)) File.Delete(success);
+        if(File.Exists(failure)) File.Delete(failure);
+        try
+        {
+            string savedBefore=DisplayManager.GetPersistentLayoutSignature();
+            await StartProjectionAsync(); await WaitForFramesAsync(); Confirm();
+            if(session is not { Confirmed:true,Completed:false }) throw new InvalidOperationException("关机恢复测试未启用投射。");
+            if(savedBefore!=DisplayManager.GetPersistentLayoutSignature()) throw new InvalidOperationException("临时投射改变了 Windows 保存的启动布局。");
+            var query=Message.Create(Handle,0x0011,IntPtr.Zero,IntPtr.Zero);
+            WndProc(ref query);
+            if(!sessionEnding || query.Result!=new IntPtr(1)) throw new InvalidOperationException("关机会话门控失败。");
+            var cancel=Message.Create(Handle,0x0016,IntPtr.Zero,IntPtr.Zero);
+            WndProc(ref cancel);
+            await StopProjectionAsync();
+            if(session!=null || sessionEnding) throw new InvalidOperationException("取消关机后没有恢复安全空闲状态。");
+            await StartProjectionAsync(); await WaitForFramesAsync(); Confirm();
+            if(savedBefore!=DisplayManager.GetPersistentLayoutSignature()) throw new InvalidOperationException("重新启用改变了保存布局。");
+            RestoreForSessionEnd(); // Exercise the real handler body without ending Windows.
+            if(session is not { Completed:true }) throw new InvalidOperationException("关机恢复未在返回前完成。");
+            if(DisplayManager.ListDisplays(false).Any(d=>d.IsPrimary && d.IsLikelyVirtual)) throw new InvalidOperationException("同步关机恢复仍留下虚拟主屏。");
+            sessionEnding=false;
+            await StopProjectionAsync();
+            File.WriteAllText(success,JsonSerializer.Serialize(new
+            {
+                Success=true,TemporaryProjectionPreservedSavedLayout=true,QueryEndSessionGated=true,
+                CanceledShutdownRestoredIdle=true,SynchronousEndSessionRecovery=true,ReenableAfterCancel=true,
+                LayoutRestored=session==null,RealSystemRebootTested=false
+            },Program.JsonOptions));
+        }
+        catch(Exception ex)
+        {
+            Program.Log(ex.ToString()); sessionEnding=false;
+            await StopProjectionAsync(); File.WriteAllText(failure,ex.ToString());
+        }
+        finally { sessionEnding=false; Close(); }
+    }
     protected override void WndProc(ref Message m)
     {
+        if(m.Msg==0x0011) // WM_QUERYENDSESSION: prevent any queued enable/reconnect.
+        {
+            sessionEnding=true; stopRequested=true;
+            reconnectCancellation?.Cancel();
+            m.Result=new IntPtr(1);
+            return;
+        }
+        if(m.Msg==0x0016) // WM_ENDSESSION: no async cleanup after returning.
+        {
+            if(m.WParam!=IntPtr.Zero)
+            {
+                RestoreForSessionEnd();
+                allowClose=true;
+                base.WndProc(ref m);
+            }
+            else
+            {
+                sessionEnding=false;
+                _=StopProjectionAsync(); // A canceled shutdown leaves a safe, idle desktop.
+            }
+            return;
+        }
         if(m.Msg==0x0312 && m.WParam.ToInt32()==5512) { _=StopProjectionAsync(); return; }
         if(m.Msg==0x0218)
         {
@@ -847,6 +1103,22 @@ public sealed class MainForm : Form
             catch(Exception ex) { Program.Log("Power notification failed: "+ex); }
         }
         base.WndProc(ref m);
+    }
+
+    private void RestoreForSessionEnd()
+    {
+        sessionEnding=true; stopRequested=true;
+        reconnectCancellation?.Cancel();
+        timer.Stop(); screenshotTimer.Stop(); screenshotPointerTimer.Stop();
+        screenshotPointer?.Hide(); engine?.RequestStop();
+        Native.ClipCursor(IntPtr.Zero);
+        // GPU teardown can wait; display recovery must finish in this handler.
+        if(session is { Completed:false })
+        {
+            bool restored=Recovery.Restore(session,Program.SessionPath,2000);
+            Program.Log("Windows session ending: synchronous display recovery="+restored);
+        }
+        projection?.Hide();
     }
     private sealed record DisplayChoice(DisplayInfo Info)
     {

@@ -39,8 +39,36 @@ internal static class Program
             if (args.Length > 0 && args[0] == "--diagnose")
             {
                 var snapshot = DisplayManager.CaptureSnapshot();
-                string output = JsonSerializer.Serialize(new { Version = "0.1.3", Runtime = Environment.Version.ToString(), OS = Environment.OSVersion.VersionString, Driver = DriverSetup.GetStatus(), Displays = DisplayManager.ListDisplays(), Snapshot = snapshot }, JsonOptions);
+                string output = JsonSerializer.Serialize(new { Version = "0.1.5", Runtime = Environment.Version.ToString(), OS = Environment.OSVersion.VersionString, Driver = DriverSetup.GetStatus(), Displays = DisplayManager.ListDisplays(), Snapshot = snapshot }, JsonOptions);
                 File.WriteAllText(args.Length > 1 ? args[1] : Path.Combine(AppContext.BaseDirectory, "diagnostics.json"), output, Encoding.UTF8);
+                return 0;
+            }
+            if(args.Length>1 && args[0]=="--trace-screenclip")
+            {
+                // Diagnostic metadata only: no screenshot, title, URL, document
+                // content, keyboard event, or application input is collected.
+                string file=Path.GetFullPath(args[1]);
+                int seconds=args.Length>2 ? Math.Clamp(int.Parse(args[2]),5,60) : 20;
+                var displays=DisplayManager.ListDisplays(false);
+                var physical=displays.FirstOrDefault(d=>!d.IsLikelyVirtual && d.Y>0)
+                    ?? displays.FirstOrDefault(d=>!d.IsLikelyVirtual) ?? throw new InvalidOperationException("没有活动实体显示器。");
+                var bounds=new Rectangle(physical.X,physical.Y,physical.Width,physical.Height);
+                var events=new System.Collections.Generic.List<object>();
+                string? previous=null;
+                var clock=Stopwatch.StartNew();
+                Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+                while(clock.Elapsed.TotalSeconds<seconds)
+                {
+                    var snapshot=ScreenClipCompatibility.DescribeCandidates(bounds);
+                    string serialized=JsonSerializer.Serialize(snapshot,JsonOptions);
+                    if(serialized!=previous)
+                    {
+                        previous=serialized;
+                        events.Add(new { At=DateTimeOffset.Now,Snapshot=snapshot });
+                        File.WriteAllText(file,JsonSerializer.Serialize(new { Seconds=seconds,Events=events },JsonOptions));
+                    }
+                    Thread.Sleep(150);
+                }
                 return 0;
             }
             if (args.Length > 0 && args[0] == "--install-driver")
@@ -56,15 +84,17 @@ internal static class Program
                 return result.Success ? 0 : 1;
             }
             if (args.Length > 0 && args[0] == "--selftest") return SelfTests.Run(args.Length > 1 ? args[1] : AppContext.BaseDirectory);
-            if(args.Length>0 && (args[0]=="--live-test" || args[0]=="--power-test" || args[0]=="--tray-test"))
+            if(args.Length>0 && (args[0]=="--live-test" || args[0]=="--power-test" || args[0]=="--tray-test" || args[0]=="--window-test" || args[0]=="--shutdown-test"))
             {
                 string folder=args.Length>1 ? args[1] : AppContext.BaseDirectory;
                 bool simulatePower=args[0]=="--power-test";
                 using var form=new MainForm();
                 bool trayTest=args[0]=="--tray-test";
-                form.Shown+=(_,_)=>form.BeginInvoke(new Action(()=> { if(trayTest) form.RunTrayTest(folder); else form.RunTimedTest(folder,simulatePower); }));
+                bool windowTest=args[0]=="--window-test";
+                bool shutdownTest=args[0]=="--shutdown-test";
+                form.Shown+=(_,_)=>form.BeginInvoke(new Action(()=> { if(shutdownTest) form.RunShutdownTest(folder); else if(windowTest) form.RunWindowTest(folder); else if(trayTest) form.RunTrayTest(folder); else form.RunTimedTest(folder,simulatePower); }));
                 Application.Run(form);
-                return File.Exists(Path.Combine(folder,trayTest?"tray-test-success.json":simulatePower?"power-test-success.json":"live-test-success.json")) ? 0 : 1;
+                return File.Exists(Path.Combine(folder,shutdownTest?"shutdown-test-success.json":windowTest?"window-test-success.json":trayTest?"tray-test-success.json":simulatePower?"power-test-success.json":"live-test-success.json")) ? 0 : 1;
             }
             using var mutex = new Mutex(true, "Local\\TopViewport.Main", out bool created);
             if (!created) { MessageBox.Show("TopViewport 已经在运行。恢复快捷键：Ctrl + Alt + F12。", "TopViewport"); return 0; }
@@ -326,13 +356,13 @@ internal static class Recovery
             Thread.Sleep(250);
         }
     }
-    public static bool Restore(SessionState state, string path)
+    public static bool Restore(SessionState state, string path, int mutexWaitMilliseconds=500)
     {
         using var mutex=new Mutex(false,"Local\\TopViewport.DisplayRecovery");
         bool held=false;
         try
         {
-            try { held=mutex.WaitOne(TimeSpan.FromMilliseconds(500)); } catch(AbandonedMutexException) { held=true; }
+            try { held=mutex.WaitOne(TimeSpan.FromMilliseconds(Math.Clamp(mutexWaitMilliseconds,100,3000))); } catch(AbandonedMutexException) { held=true; }
             if(!held) throw new TimeoutException("另一恢复操作尚未完成，请稍后重试。");
             var already=Read(path);
             if (already is null && File.Exists(path))
@@ -455,6 +485,8 @@ internal static class Native
     [DllImport("user32.dll")] public static extern bool ClipCursor(IntPtr rect);
     [DllImport("user32.dll")] public static extern bool GetClipCursor(out Rect rect);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll", SetLastError=true)] public static extern bool RegisterHotKey(IntPtr hwnd, int id, uint modifiers, uint key);
     [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hwnd,int id);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd,IntPtr insertAfter,int x,int y,int cx,int cy,uint flags);

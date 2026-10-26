@@ -23,6 +23,10 @@ internal static class SelfTests
             catch(Exception ex) { failures++; checks.Add(new { name,pass=false,error=ex.ToString() }); }
         }
         DisplayIdentityTests.AddChecks(Check);
+        DisplayPersistenceTests.AddChecks(Check);
+        WindowPlacementGuardTests.AddChecks(Check);
+        ScreenClipCompatibilityTests.AddChecks(Check);
+        ScreenshotCursorOverlayTests.AddChecks(Check);
         Check("Enumerate active physical display and mode",()=>
         {
             var displays=DisplayManager.ListDisplays();

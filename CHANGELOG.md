@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.1.5
+
+### Fixed
+
+- Projection now uses a temporary Windows display configuration without saving the virtual primary display as the next startup layout. Older versions could leave a black sign-in screen or an empty physical desktop after a restart when projection was not running.
+- Windows session-ending notifications synchronously restore the saved layout before returning. Pending enable and reconnect work is gated during shutdown; canceling shutdown leaves a safe idle desktop that can be enabled again.
+- Windows snipping-overlay detection now checks the foreground window directly, including UWP windows omitted from ordinary top-level enumeration. A click-through crosshair follows the physical pointer during snipping without taking focus.
+
+### Validation
+
+- Added comparisons of the saved display configuration before and during projection, session-ending recovery checks, canceled-shutdown checks, and crosshair focus and click-through checks.
+- A user manually confirmed a visible pointer and working selection with the built-in `Win + Shift + S` tool in 0.1.5 on one Windows 10 machine. Shutdown notification checks are simulated and do not restart Windows; a real reboot still needs manual verification. Secure-desktop and universal screenshot-tool compatibility are not established.
+
+## 0.1.4
+
+### Fixed
+
+- Ordinary application windows that reopen on the physical output display can be moved into the visible virtual desktop, instead of remaining hidden behind the projection surface.
+- Window recovery preserves minimized state, avoids activating recovered windows, and leaves windows on other accessible monitors in place. Shell surfaces, menus and captionless fullscreen windows are excluded.
+- Recognized foreground Windows snipping overlays can temporarily use pointer coordinates in the visible physical output area. Virtual-desktop confinement resumes after the overlay closes and mouse buttons are released; ordinary applications and background screenshot processes do not release it.
+
+### Added
+
+- A tray action to recover inaccessible windows and a toggle for automatic recovery, enabled by default.
+- Synthetic-window regression checks for placement and state handling, plus a `--window-test` integration command that moves only its own test windows.
+- Pointer-coordinate round-trip and heartbeat-confinement checks. Actual `Win + Shift + S` and third-party screenshot-tool compatibility still require validation; additional-monitor preservation is checked with geometry only.
+- Documentation explaining why Windows shows two logical displays and how to recover an application that remembers the hidden output display.
+
 ## 0.1.3
 
 ### Fixed

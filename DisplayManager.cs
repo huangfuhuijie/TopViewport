@@ -71,7 +71,9 @@ public static class DisplayManager
     private const uint CdsTest = 0x2;
     private const uint CdsSetPrimary = 0x10;
     private const uint CdsNoReset = 0x10000000;
+    private const uint QdcAllPaths = 0x1;
     private const uint QdcOnlyActivePaths = 0x2;
+    private const uint QdcDatabaseCurrent = 0x4;
     private const uint SdcUseSuppliedDisplayConfig = 0x20;
     private const uint SdcValidate = 0x40;
     private const uint SdcApply = 0x80;
@@ -336,15 +338,22 @@ public static class DisplayManager
 
         // Also roll back partial staging errors; the persisted caller snapshot protects against process failure.
         var recovery = CaptureSnapshot();
+        if (recovery.NativeTopology is null)
+            throw new InvalidOperationException("Windows could not save a temporary rollback topology; projection was not applied.");
+        string savedLayoutSignature = GetPersistentLayoutSignature();
         try
         {
-            foreach (var item in staged)
-            {
-                var mode = item.Mode;
-                CheckChangeResult(ChangeDisplaySettingsEx(item.Name, ref mode, IntPtr.Zero,
-                    CdsUpdateRegistry | CdsNoReset | (item.Primary ? CdsSetPrimary : 0), IntPtr.Zero), $"Staging {item.Name}");
-            }
-            CheckChangeResult(ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero), "Applying the display layout");
+            // Projection must never become the Windows boot/sign-in layout: the virtual
+            // primary has no visible image until this process starts rendering. Legacy
+            // CDS_NORESET staging requires CDS_UPDATEREGISTRY and therefore is unsafe.
+            // CCD explicitly supports a temporary configuration without database writes.
+            var temporary = BuildTemporaryTopology(staged);
+            int validation = SetNativeTopology(temporary, SdcUseSuppliedDisplayConfig | SdcValidate);
+            if (validation != 0)
+                throw new Win32Exception(validation, "Windows rejected the temporary display layout; no persistent display settings were changed.");
+            int applied = SetNativeTopology(temporary, TemporaryApplyFlags);
+            if (applied != 0)
+                throw new Win32Exception(applied, "Windows could not apply the temporary display layout.");
 
             // Drivers sometimes report success while choosing a different mode. Refuse that silently degraded state.
             var actual = ListDisplays(false);
@@ -356,6 +365,8 @@ public static class DisplayManager
                 p.X != 0 || p.Y != virtualHeight || p.Width != physicalDisplay.Width || p.Height != physicalDisplay.Height ||
                 p.RefreshRate != physicalDisplay.RefreshRate)
                 throw new InvalidOperationException("The display driver did not accept the requested exact layout.");
+            if (!string.Equals(savedLayoutSignature, GetPersistentLayoutSignature(), StringComparison.Ordinal))
+                throw new InvalidOperationException("The display driver changed the saved Windows layout while applying a temporary projection; the usable layout will be restored.");
             return new DisplayApplyResult(virtualDeviceName, physicalDeviceName,
                 new DisplayMode(v.Width, v.Height, v.RefreshRate, v.BitsPerPixel),
                 new DisplayRectangle(v.X, v.Y, v.X + v.Width, v.Y + v.Height),
@@ -363,13 +374,152 @@ public static class DisplayManager
         }
         catch (Exception applyError)
         {
-            try { RestoreSnapshot(recovery); }
+            // A reconnect may start from an existing virtual-primary projection.
+            // Saving that rollback layout would reintroduce the unsafe boot layout.
+            // Only the caller's separate original-layout recovery may persist settings.
+            try { RestoreTemporarySnapshot(recovery); }
             catch (Exception restoreError)
             {
                 throw new AggregateException("The layout failed and automatic recovery also failed. Use the saved recovery file.", applyError, restoreError);
             }
             throw new InvalidOperationException("The requested layout failed; the previous display layout has been restored. " + applyError.Message, applyError);
         }
+    }
+
+    // Kept separate from recovery flags: restoring a known usable physical layout is
+    // persistent, whereas the projection layout must always be session-only.
+    internal const uint TemporaryApplyFlags = SdcUseSuppliedDisplayConfig | SdcApply;
+
+    /// <summary>Read-only fingerprint of saved CCD paths and source positions, independent of the live temporary layout.</summary>
+    internal static string GetPersistentLayoutSignature()
+    {
+        var persisted = CaptureNativeTopology(QdcDatabaseCurrent)
+            ?? throw new InvalidOperationException("Cannot verify the saved Windows display layout.");
+        var entries = new List<string>();
+        var handle = GCHandle.Alloc(persisted.Paths, GCHandleType.Pinned);
+        try
+        {
+            for (int i = 0; i < persisted.PathCount; i++)
+            {
+                var path = Marshal.PtrToStructure<DISPLAYCONFIG_PATH_INFO>(IntPtr.Add(handle.AddrOfPinnedObject(), i * NativePathBytes));
+                string geometry = "unspecified";
+                if (path.sourceInfo.modeInfoIdx < persisted.ModeCount)
+                {
+                    int start = checked((int)path.sourceInfo.modeInfoIdx * NativeModeBytes);
+                    geometry = string.Join(",", Enumerable.Range(0, 5).Select(j => BitConverter.ToUInt32(persisted.Modes, start + 16 + j * 4)));
+                }
+                entries.Add($"{path.sourceInfo.adapterId.HighPart}:{path.sourceInfo.adapterId.LowPart}:{path.sourceInfo.id}>" +
+                    $"{path.targetInfo.adapterId.HighPart}:{path.targetInfo.adapterId.LowPart}:{path.targetInfo.id}:" +
+                    $"{geometry}:{path.targetInfo.rotation}:{path.targetInfo.scaling}:{path.targetInfo.refreshRateNumerator}/{path.targetInfo.refreshRateDenominator}");
+            }
+        }
+        finally { handle.Free(); }
+        return string.Join(";", entries.OrderBy(x => x, StringComparer.Ordinal));
+    }
+
+    private static DisplayConfigBackup BuildTemporaryTopology(IReadOnlyList<(string Name, DEVMODE Mode, bool Primary)> requested)
+    {
+        var inventory = CaptureNativeTopology(QdcAllPaths)
+            ?? throw new InvalidOperationException("Windows could not enumerate display paths; the temporary layout was not applied.");
+        var paths = new List<DISPLAYCONFIG_PATH_INFO>();
+        var modes = new List<byte[]>();
+        var handle = GCHandle.Alloc(inventory.Paths, GCHandleType.Pinned);
+        try
+        {
+            foreach (var item in requested.OrderByDescending(x => x.Primary))
+            {
+                var candidates = new List<DISPLAYCONFIG_PATH_INFO>();
+                for (int i = 0; i < inventory.PathCount; i++)
+                {
+                    var path = Marshal.PtrToStructure<DISPLAYCONFIG_PATH_INFO>(IntPtr.Add(handle.AddrOfPinnedObject(), i * NativePathBytes));
+                    if (path.targetInfo.targetAvailable == 0) continue;
+                    var source = new DISPLAYCONFIG_SOURCE_DEVICE_NAME
+                    {
+                        header = new DISPLAYCONFIG_DEVICE_INFO_HEADER { type = 1, size = (uint)Marshal.SizeOf<DISPLAYCONFIG_SOURCE_DEVICE_NAME>(),
+                            adapterId = path.sourceInfo.adapterId, id = path.sourceInfo.id }, viewGdiDeviceName = ""
+                    };
+                    if (DisplayConfigGetDeviceInfo(ref source) == 0 &&
+                        string.Equals(source.viewGdiDeviceName, item.Name, StringComparison.OrdinalIgnoreCase))
+                        candidates.Add(path);
+                }
+                var active = candidates.Where(x => (x.flags & 1) != 0).ToArray();
+                if (active.Length > 1 || (active.Length == 0 && candidates.Count != 1))
+                    throw new InvalidOperationException($"The display path for {item.Name} is missing or ambiguous; no persistent fallback will be used.");
+                var chosen = active.Length == 1 ? active[0] : candidates[0];
+                uint oldSourceIndex = chosen.sourceInfo.modeInfoIdx;
+                var sourceMode = new byte[NativeModeBytes];
+                WriteUInt32(sourceMode, 0, 1); // DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+                WriteUInt32(sourceMode, 4, chosen.sourceInfo.id);
+                WriteUInt32(sourceMode, 8, chosen.sourceInfo.adapterId.LowPart);
+                WriteUInt32(sourceMode, 12, unchecked((uint)chosen.sourceInfo.adapterId.HighPart));
+                WriteUInt32(sourceMode, 16, item.Mode.dmPelsWidth);
+                WriteUInt32(sourceMode, 20, item.Mode.dmPelsHeight);
+                WriteUInt32(sourceMode, 24, item.Mode.dmBitsPerPel switch { 32 => 4u, 24 => 3u, 16 => 2u, 8 => 1u,
+                    _ => throw new InvalidOperationException("Unsupported CCD source color depth.") });
+                WriteUInt32(sourceMode, 28, unchecked((uint)item.Mode.dmPositionX));
+                WriteUInt32(sourceMode, 32, unchecked((uint)item.Mode.dmPositionY));
+                chosen.sourceInfo.modeInfoIdx = (uint)modes.Count;
+                modes.Add(sourceMode);
+
+                // Preserve the physical signal timing verbatim. A detached virtual
+                // target has no current timing; Windows must solve it from the exact
+                // source dimensions and requested target frequency, without ALLOW_CHANGES.
+                uint oldTargetIndex = chosen.targetInfo.modeInfoIdx;
+                bool preserveTiming = (chosen.flags & 1) != 0 && oldTargetIndex < inventory.ModeCount &&
+                    oldSourceIndex < inventory.ModeCount &&
+                    BitConverter.ToUInt32(inventory.Modes, checked((int)oldSourceIndex * NativeModeBytes + 16)) == item.Mode.dmPelsWidth &&
+                    BitConverter.ToUInt32(inventory.Modes, checked((int)oldSourceIndex * NativeModeBytes + 20)) == item.Mode.dmPelsHeight;
+                chosen.targetInfo.modeInfoIdx = uint.MaxValue;
+                if (preserveTiming)
+                {
+                    var targetMode = new byte[NativeModeBytes];
+                    Buffer.BlockCopy(inventory.Modes, checked((int)oldTargetIndex * NativeModeBytes), targetMode, 0, NativeModeBytes);
+                    if (BitConverter.ToUInt32(targetMode, 0) != 2)
+                        throw new InvalidOperationException("Windows returned an invalid target mode index.");
+                    chosen.targetInfo.modeInfoIdx = (uint)modes.Count;
+                    modes.Add(targetMode);
+                }
+                chosen.targetInfo.rotation = checked(item.Mode.dmDisplayOrientation + 1);
+                if (!preserveTiming)
+                {
+                    chosen.targetInfo.scaling = 1; // DISPLAYCONFIG_SCALING_IDENTITY
+                    chosen.targetInfo.refreshRateNumerator = item.Mode.dmDisplayFrequency;
+                    chosen.targetInfo.refreshRateDenominator = 1;
+                    // UNSPECIFIED is valid only when both refresh-rate fields are
+                    // zero. We request an exact frequency, so use progressive.
+                    chosen.targetInfo.scanLineOrdering = 1;
+                }
+                // The query intentionally omits QDC_VIRTUAL_MODE_AWARE, so indices
+                // use the original, unpacked source/target union interpretation.
+                chosen.flags = 1;
+                paths.Add(chosen);
+            }
+        }
+        finally { handle.Free(); }
+        var pathBytes = new byte[checked(paths.Count * NativePathBytes)];
+        var pathHandle = GCHandle.Alloc(pathBytes, GCHandleType.Pinned);
+        try
+        {
+            for (int i = 0; i < paths.Count; i++)
+                Marshal.StructureToPtr(paths[i], IntPtr.Add(pathHandle.AddrOfPinnedObject(), i * NativePathBytes), false);
+        }
+        finally { pathHandle.Free(); }
+        return new DisplayConfigBackup((uint)paths.Count, (uint)modes.Count, pathBytes, modes.SelectMany(x => x).ToArray());
+    }
+
+    private static void WriteUInt32(byte[] bytes, int offset, uint value) =>
+        Buffer.BlockCopy(BitConverter.GetBytes(value), 0, bytes, offset, sizeof(uint));
+
+    private static void RestoreTemporarySnapshot(DisplaySnapshot snapshot)
+    {
+        snapshot = ResolveSnapshotDisplayNames(snapshot);
+        var native = snapshot.NativeTopology
+            ?? throw new InvalidOperationException("Display paths changed during temporary rollback; use the saved original-layout recovery.");
+        int error = SetNativeTopology(native, SdcUseSuppliedDisplayConfig | SdcValidate);
+        if (error == 0) error = SetNativeTopology(native, TemporaryApplyFlags);
+        if (error != 0) throw new Win32Exception(error, "The temporary rollback topology could not be restored.");
+        VerifyRestoredTopology(snapshot);
+        RestoreWorkAreas(snapshot, new List<string>());
     }
 
     public static DisplayRestoreResult RestoreSnapshot(DisplaySnapshot snapshot, bool restoreWorkAreas = true)
@@ -611,18 +761,20 @@ public static class DisplayManager
 
     private static DisplayRectangle ToRectangle(RECT rect) => new(rect.Left, rect.Top, rect.Right, rect.Bottom);
 
-    private static DisplayConfigBackup? CaptureNativeTopology()
+    private static DisplayConfigBackup? CaptureNativeTopology(uint queryFlags = QdcOnlyActivePaths)
     {
         for (int attempt = 0; attempt < 5; attempt++)
         {
-            int error = GetDisplayConfigBufferSizes(QdcOnlyActivePaths, out uint pathCount, out uint modeCount);
+            int error = GetDisplayConfigBufferSizes(queryFlags, out uint pathCount, out uint modeCount);
             if (error != 0) return null;
-            if (pathCount is 0 or > 128 || modeCount > 512) return null;
+            if (pathCount is 0 or > 4096 || modeCount > 4096) return null;
             IntPtr paths = Marshal.AllocHGlobal(checked((int)pathCount * NativePathBytes));
             IntPtr modes = Marshal.AllocHGlobal(Math.Max(1, checked((int)modeCount * NativeModeBytes)));
             try
             {
-                error = QueryDisplayConfig(QdcOnlyActivePaths, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
+                IntPtr topologyId = queryFlags == QdcDatabaseCurrent ? Marshal.AllocHGlobal(sizeof(uint)) : IntPtr.Zero;
+                try { error = QueryDisplayConfig(queryFlags, ref pathCount, paths, ref modeCount, modes, topologyId); }
+                finally { if (topologyId != IntPtr.Zero) Marshal.FreeHGlobal(topologyId); }
                 if (error == ErrorInsufficientBuffer) continue;
                 if (error != 0) return null;
                 var pathBytes = new byte[checked((int)pathCount * NativePathBytes)];
@@ -638,16 +790,20 @@ public static class DisplayManager
 
     private static int RestoreNativeTopology(DisplayConfigBackup backup)
     {
+        int error = SetNativeTopology(backup, SdcUseSuppliedDisplayConfig | SdcValidate);
+        return error != 0 ? error : SetNativeTopology(backup, SdcUseSuppliedDisplayConfig | SdcApply | SdcSaveToDatabase);
+    }
+
+    private static int SetNativeTopology(DisplayConfigBackup backup, uint flags)
+    {
         IntPtr paths = Marshal.AllocHGlobal(backup.Paths.Length);
         IntPtr modes = Marshal.AllocHGlobal(Math.Max(1, backup.Modes.Length));
         try
         {
             Marshal.Copy(backup.Paths, 0, paths, backup.Paths.Length);
             Marshal.Copy(backup.Modes, 0, modes, backup.Modes.Length);
-            int error = SetDisplayConfig(backup.PathCount, paths, backup.ModeCount, modes, SdcUseSuppliedDisplayConfig | SdcValidate);
-            if (error != 0) return error;
             return SetDisplayConfig(backup.PathCount, paths, backup.ModeCount, modes,
-                SdcUseSuppliedDisplayConfig | SdcApply | SdcSaveToDatabase);
+                flags);
         }
         finally { Marshal.FreeHGlobal(paths); Marshal.FreeHGlobal(modes); }
     }
